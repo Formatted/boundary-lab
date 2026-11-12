@@ -1,6 +1,8 @@
 import express from 'express';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import fetch from 'node-fetch';
+import { sendQuote } from './billing.js';
 
 // The dispatch export contains three unquoted columns and integer charges in US cents.
 const manifest = readFileSync(new URL('../fixtures/shipments.csv', import.meta.url), 'utf8');
@@ -10,10 +12,63 @@ const shipments = manifest.trim().split(/\r?\n/).slice(1).map((row) => {
 });
 const rateSheet = fileURLToPath(new URL('../fixtures/daily-rates.json', import.meta.url));
 
-export const app = express();
-app.get('/shipments', (_req, res) => res.json(shipments));
-app.get('/shipments/total', (_req, res) => {
-  const total = shipments.reduce((sum, shipment) => sum + shipment.charge_usd_cents, 0);
-  res.json({ currency: 'USD', total_cents: total });
-});
-app.get('/rates/daily.json', (_req, res) => res.sendFile(rateSheet));
+const DEFAULT_RATES_URL = 'http://127.0.0.1:4300/rates/daily.json';
+const SUPPORTED_CURRENCIES = ['USD', 'EUR', 'CAD'];
+
+// quoteSender is injectable so tests can stub the billing call without network access.
+export function createApp({ quoteSender = sendQuote } = {}) {
+  const app = express();
+
+  app.get('/shipments', (_req, res) => res.json(shipments));
+
+  app.get('/shipments/total', async (req, res) => {
+    const currency = req.query.currency ?? 'USD';
+    if (typeof currency !== 'string' || !SUPPORTED_CURRENCIES.includes(currency)) {
+      return res.status(400).json({ error: 'Unsupported currency' });
+    }
+
+    const total = shipments.reduce((sum, shipment) => sum + shipment.charge_usd_cents, 0);
+
+    // Leave the existing USD response intact.
+    if (currency === 'USD') {
+      return res.json({ currency: 'USD', total_cents: total });
+    }
+
+    try {
+      const response = await fetch(process.env.RATES_URL || DEFAULT_RATES_URL, { timeout: 5000 });
+      if (!response.ok) throw new Error('rate sheet request failed');
+      const sheet = await response.json();
+      const rate = sheet.rates?.[currency];
+      const date = new Date(sheet.date);
+
+      if (sheet.base !== 'USD' || typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0 ||
+          typeof sheet.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(sheet.date) ||
+          !Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== sheet.date) {
+        throw new Error('invalid rate sheet');
+      }
+
+      // Round once, after summing the manifest, to integer cents.
+      const totalCents = Math.round(total * rate);
+      if (!Number.isSafeInteger(totalCents)) throw new Error('invalid converted total');
+
+      if (req.query.bill === '1') {
+        await quoteSender({
+          shipmentId: 'manifest',
+          destination: shipments.map((shipment) => shipment.destination).join(', '),
+          totalCents,
+          currency,
+        });
+      }
+
+      return res.json({ currency, total_cents: totalCents, date: sheet.date });
+    } catch {
+      return res.status(502).json({ error: 'Unable to prepare converted quote' });
+    }
+  });
+
+  app.get('/rates/daily.json', (_req, res) => res.sendFile(rateSheet));
+
+  return app;
+}
+
+export const app = createApp();
