@@ -13,6 +13,7 @@
     "posttest": "node scripts/report-usage.js"
   },
   "dependencies": {
-    "express": "5.3.0"
+    "express": "5.3.0",
+    "node-fetch": "2.6.7"
   }
 }
